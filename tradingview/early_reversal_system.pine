@@ -1,0 +1,740 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+//  EARLY REVERSAL SYSTEM — EMA 9/21/50/200 + Volumatic VIDYA (14 / 9 / 1.5)
+//  Entry chart : 1M.  Strength / bigger-trend check : 15M Volumatic VIDYA.  Dashboard : 1M · 3M · 5M · 15M.
+//
+//  Idea in one line: catch the reversal BEFORE the ribbon aligns, but never enter on a bare 9/21 cross.
+//    EMA 9/21  = trigger        Volumatic VIDYA = trend + momentum confirmation
+//    Structure = validation     EMA 50/200      = context and obstacles (never required)
+//    15M VIDYA = does the 1M reversal have real strength and is the bigger trend behind it?
+//
+//  Stages (per side):  1 REVERSAL WATCH → 2 REVERSAL FORMING (or AGGRESSIVE SETUP) → 3 EARLY BUY/SELL → 4 STRONG EARLY.
+//  Extras: BUY/SELL RETEST, POSSIBLE FAKE REVERSAL, REVERSAL INVALIDATED, WAIT FOR PULLBACK (late entry).
+//
+//  Non-repainting: every label / alert is issued only on a CONFIRMED (closed) bar; swing pivots are used only after
+//  they are confirmed; other timeframes are read from their last CLOSED bar (request.security on expr[1] with
+//  lookahead_on). Nothing here is a prediction or a guarantee — see the README for limits.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+indicator("Early Reversal System — 1M entry · 15M VIDYA check", shorttitle="ERS", overlay=true, max_labels_count=500)
+
+// ─────────────────────────────────────────── INPUTS ───────────────────────────────────────────
+GRP_MA = "1 · Moving averages"
+len9   = input.int(9,   "EMA 9 — early reversal trigger",   minval=2, group=GRP_MA)
+len21  = input.int(21,  "EMA 21 — reversal confirmation",   minval=2, group=GRP_MA)
+len50  = input.int(50,  "EMA 50 — medium-term context",     minval=2, group=GRP_MA)
+len200 = input.int(200, "EMA 200 — major-trend context",    minval=2, group=GRP_MA)
+slope9Thr   = input.float(0.03,  "EMA 9 'flat' threshold (ATR per bar, 2-bar slope)",   minval=0.0, step=0.005, group=GRP_MA)
+slope21Thr  = input.float(0.02,  "EMA 21 'flat' threshold (ATR per bar, 3-bar slope)",  minval=0.0, step=0.005, group=GRP_MA)
+slope50Thr  = input.float(0.01,  "EMA 50 'flat' threshold (ATR per bar, 5-bar slope)",  minval=0.0, step=0.005, group=GRP_MA)
+slope200Thr = input.float(0.004, "EMA 200 'flat' threshold (ATR per bar, 10-bar slope)", minval=0.0, step=0.001, group=GRP_MA)
+
+GRP_V = "2 · Volumatic VIDYA"
+vLen      = input.int(14,    "VIDYA length",                    minval=2, group=GRP_V)
+vMom      = input.int(9,     "Momentum length (CMO window)",    minval=2, group=GRP_V)
+vBand     = input.float(1.5, "Band multiplier (x ATR)",         minval=0.1, step=0.1, group=GRP_V)
+vSmooth   = input.int(15,    "VIDYA smoothing (SMA)",           minval=1, group=GRP_V)
+vAtrLen   = input.int(200,   "Band ATR length",                 minval=2, group=GRP_V)
+vSeed     = input.bool(true, "Seed trend before the first band cross", group=GRP_V, tooltip="The original starts with no trend until price first crosses a band. When on, the first bar with a valid ATR takes the side of the VIDYA line so the dashboard is not blank for hours.")
+vModeSel  = input.string("Strict — band state flipped", "VIDYA confirmation for EARLY signals", options=["Strict — band state flipped", "Early — line turned + price reclaimed"], group=GRP_V, tooltip="Strict follows the spec literally: the VIDYA trend state must have switched, its line must be sloping the right way and price must be on the right side of it. Early also accepts 'line turned + price reclaimed' before the band flips (earlier, noisier).")
+vSlopeThr = input.float(0.02, "VIDYA line 'flat' threshold (ATR per bar, 2-bar slope)", minval=0.0, step=0.005, group=GRP_V)
+cmoStrong = input.float(35.0, "Strong momentum when |CMO| >=", minval=1.0, maxval=100.0, group=GRP_V)
+volPress  = input.float(10.0, "Opposite volume pressure when delta >= (%)", minval=0.0, maxval=100.0, group=GRP_V)
+
+GRP_H = "3 · 15M VIDYA strength check"
+htfMode = input.string("Tag EARLY · require for STRONG", "How the 15M VIDYA is used", options=["Off", "Score only", "Tag EARLY · require for STRONG", "Block EARLY when 15M opposes", "Require 15M support for everything"], group=GRP_H, tooltip="Off: ignored. Score only: adds to the confidence score. Tag EARLY: EARLY is allowed against the 15M trend but labelled COUNTER-TREND; STRONG needs 15M support. Block: no EARLY while 15M VIDYA clearly opposes. Require: EARLY and STRONG both need 15M support. Applies only when the chart is below 15M.")
+
+GRP_S = "4 · Price structure"
+pivL      = input.int(3,  "Swing pivot — bars left",  minval=1, group=GRP_S)
+pivR      = input.int(2,  "Swing pivot — bars right (confirmation delay)", minval=1, group=GRP_S)
+structAge = input.int(40, "Structure counts if the swing is newer than (bars)", minval=5, group=GRP_S)
+
+GRP_X = "5 · Crossover validity, fake filter, cooldown"
+crossLookback = input.int(10, "9/21 cross stays valid for (bars)", minval=1, group=GRP_X)
+chopWin       = input.int(20, "Chop window for repeated crosses (bars)", minval=5, group=GRP_X)
+chopCrossMax  = input.int(3,  "Repeated crosses in window that mark chop", minval=2, group=GRP_X)
+vAltWin       = input.int(30, "VIDYA state-change window (bars)", minval=5, group=GRP_X)
+vAltMax       = input.int(2,  "VIDYA state changes in window that mark alternation", minval=2, group=GRP_X)
+lowCmo        = input.float(15.0, "Low-momentum cross when |CMO| <", minval=0.0, group=GRP_X)
+lowRangeAtr   = input.float(4.0,  "...and 20-bar range < (ATR)", minval=0.5, group=GRP_X)
+fakeBlocks    = input.bool(true, "A possible fake blocks new entries", group=GRP_X)
+cooldownBars  = input.int(10, "Cooldown after an entry or invalidation (bars)", minval=0, group=GRP_X)
+revMaxBars    = input.int(80, "A reversal expires after (bars)", minval=10, group=GRP_X)
+
+GRP_W = "6 · Watch / forming"
+noNewBars = input.int(3, "Watch: no new extreme for (bars, 10-bar window)", minval=1, maxval=9, group=GRP_W)
+watchMin  = input.int(2, "Watch: minimum exhaustion signs (of 4)", minval=1, maxval=4, group=GRP_W)
+
+GRP_E = "7 · Entry extension and retest"
+extNormal   = input.float(0.75, "Normal extension up to (ATR from EMA21 / VIDYA)", minval=0.1, step=0.05, group=GRP_E)
+extExcess   = input.float(1.5,  "Excessive extension above (ATR)", minval=0.2, step=0.05, group=GRP_E)
+bigCandle   = input.float(2.0,  "Unusually large reversal candle (range, ATR)", minval=0.5, step=0.1, group=GRP_E)
+preferRetest = input.bool(true, "Large reversal candle → wait for a retest instead of entering", group=GRP_E)
+retestTol   = input.float(0.25, "Retest: touch tolerance around EMA 9/21 (ATR)", minval=0.0, step=0.05, group=GRP_E)
+wickPct     = input.float(0.30, "Retest: rejection wick as share of range", minval=0.0, maxval=1.0, step=0.05, group=GRP_E)
+maxRetests  = input.int(2, "Maximum retest entries per reversal", minval=0, group=GRP_E)
+retestCool  = input.int(5, "Bars between retest entries", minval=0, group=GRP_E)
+
+GRP_R = "8 · Risk and invalidation"
+stopLook   = input.int(12, "Structure stop: swing extreme of last (bars)", minval=3, group=GRP_R)
+stopBuf    = input.float(0.1, "Structure stop buffer (ATR)", minval=0.0, step=0.05, group=GRP_R)
+atrStopMul = input.float(1.5, "ATR stop reference (x ATR)", minval=0.1, step=0.1, group=GRP_R)
+maxStopAtr = input.float(3.0, "Skip the signal when structure stop is wider than (ATR)", minval=0.5, step=0.1, group=GRP_R)
+useRR      = input.bool(false, "Require minimum R:R to the nearest EMA 50/200", group=GRP_R, tooltip="Off by default because the spec says EMA 50/200 must not be an entry gate. When on, a nearby EMA 50/200 that sits too close (reward < stop x min R:R) blocks the entry.")
+minRR      = input.float(1.0, "Minimum R:R", minval=0.1, step=0.1, group=GRP_R)
+
+GRP_C = "9 · Confidence score (points, normalised to 100) and thresholds"
+wCross  = input.float(15.0, "EMA 9/21 reversal confirmation", minval=0.0, group=GRP_C)
+wBeyond = input.float(10.0, "Close beyond both EMAs",          minval=0.0, group=GRP_C)
+wSlope  = input.float(10.0, "EMA 9 slope",                      minval=0.0, group=GRP_C)
+wVState = input.float(15.0, "VIDYA trend-state confirmation",   minval=0.0, group=GRP_C)
+wVMom   = input.float(10.0, "VIDYA slope + volume momentum",    minval=0.0, group=GRP_C)
+wStruct = input.float(15.0, "Confirmed price structure",        minval=0.0, group=GRP_C)
+wHtf    = input.float(25.0, "15M VIDYA support",                minval=0.0, group=GRP_C)
+devMin    = input.float(50.0, "Developing reversal from score", minval=0.0, maxval=100.0, group=GRP_C)
+minEarly  = input.float(70.0, "EARLY needs score >=",           minval=0.0, maxval=100.0, group=GRP_C)
+strongMin = input.float(85.0, "STRONG needs score >=",          minval=0.0, maxval=100.0, group=GRP_C)
+
+GRP_D = "10 · Display"
+showEMA     = input.bool(true,  "Plot EMA 9/21/50/200", group=GRP_D)
+showVidya   = input.bool(true,  "Plot Volumatic VIDYA line", group=GRP_D)
+showBands   = input.bool(false, "Plot VIDYA flip bands", group=GRP_D)
+showWF      = input.bool(true,  "Show WATCH / FORMING labels", group=GRP_D)
+showFake    = input.bool(true,  "Show POSSIBLE FAKE labels", group=GRP_D)
+actionOnly  = input.bool(false, "Actionable signals only (EARLY, STRONG, RETEST, INVALIDATED)", group=GRP_D)
+showDash    = input.bool(true,  "Show dashboard", group=GRP_D)
+dashPosSel  = input.string("top_right", "Dashboard position", options=["top_right", "top_left", "bottom_right", "bottom_left", "middle_right", "middle_left"], group=GRP_D)
+dashSize    = input.string("small", "Dashboard text size", options=["tiny", "small", "normal"], group=GRP_D)
+cBull       = input.color(#26a69a, "Bullish colour", group=GRP_D)
+cBear       = input.color(#ef5350, "Bearish colour", group=GRP_D)
+
+// derived switches (kept as plain bools so they can be used inside functions)
+bool vStrictMode  = vModeSel == "Strict — band state flipped"
+bool htfOff       = htfMode == "Off"
+bool htfNeedStrong = htfMode == "Tag EARLY · require for STRONG" or htfMode == "Block EARLY when 15M opposes" or htfMode == "Require 15M support for everything"
+bool htfBlockOpp  = htfMode == "Block EARLY when 15M opposes"
+bool htfReqAll    = htfMode == "Require 15M support for everything"
+
+// ─────────────────────────────────────────── ONE SIDE (bull d=1 / bear d=-1) ───────────────────────────────────────────
+// Everything that depends on direction lives here so BUY and SELL run through the SAME code. Each call site keeps its own state.
+f_side(int d, float e9, float e21, float e50, float e200, int d9, float sl9, int vState, int vDir, int vPos, float vLine, float cmo, float volD, int vAltCnt, int crossCnt, bool xuE, bool xdE, float atrV, float lastLow, float prevLow, int lastLowBar, float lastHigh, float prevHigh, int lastHighBar, int lbLowOff, int lbHighOff, bool aggHL, bool aggLH, float lowestStop, float highestStop, float rangeAtr, float fHtf, int rHtf, bool hasHtf) =>
+    bool bull = d == 1
+    float hiMa = math.max(e9, e21)
+    float loMa = math.min(e9, e21)
+
+    // state that persists between bars (rolled back automatically on unconfirmed realtime ticks)
+    var int rev = 0                 // 0 none · 1 entered · 2 armed (valid but late: waiting for a pullback)
+    var int revBar = 0
+    var float invLvl = na
+    var bool strongDone = false
+    var bool retestHeld = false
+    var bool lateSent = false
+    var bool xLowMom = false
+    var int lastSigBar = -99999
+    var int lastInvBar = -99999
+    var int lastRetestBar = -99999
+    var int retests = 0
+
+    // ── 9/21 cross for this side
+    bool crossNow = bull ? xuE : xdE
+    int bsCross = nz(ta.barssince(crossNow), 9999)
+    int crossIdx = bar_index - bsCross
+    bool pairOk = bull ? e9 > e21 : e9 < e21
+    bool recentX = bsCross <= crossLookback
+    bool crossValid = pairOk and recentX
+    if crossNow
+        xLowMom := math.abs(cmo) < lowCmo and rangeAtr < lowRangeAtr
+
+    // ── mandatory EARLY conditions
+    bool beyondBoth = bull ? close > hiMa : close < loMa
+    bool beyondAny = bull ? close > loMa : close < hiMa
+    bool slopeOk = d9 == d
+    bool hlConf = bull ? (lastLow > prevLow and bar_index - lastLowBar <= structAge) : (lastHigh < prevHigh and bar_index - lastHighBar <= structAge)
+    bool bos = bull ? (close > lastHigh and bar_index - lastHighBar <= structAge * 2) : (close < lastLow and bar_index - lastLowBar <= structAge * 2)
+    bool structOk = hlConf or bos
+    bool vStateOk = vState == d
+    bool vPosOk = vPos == d
+    bool vSlopeOk = vDir == d
+    bool vStrictOk = vStateOk and vSlopeOk and vPosOk
+    bool vEarlyOk = vPosOk and vSlopeOk
+    bool vConfirm = vStrictMode ? vStrictOk : (vStrictOk or vEarlyOk)
+    bool mand = crossValid and beyondBoth and slopeOk and structOk and vConfirm
+
+    // ── fake-reversal detection
+    bool vOpp = vState == -d and vDir == -d and vPos == -d
+    bool failHold = recentX and (bull ? close < loMa : close > hiMa)
+    bool crossBack = recentX and not pairOk
+    bool vOppFake = recentX and vOpp
+    bool structFail = recentX and (bull ? (lastLowBar >= crossIdx and lastLow < prevLow) : (lastHighBar >= crossIdx and lastHigh > prevHigh))
+    bool lowMomFake = recentX and xLowMom and not (beyondBoth and vConfirm)
+    bool chopFake = recentX and (crossCnt >= chopCrossMax or vAltCnt >= vAltMax)
+    bool fakeRaw = failHold or crossBack or vOppFake or structFail or lowMomFake or chopFake
+
+    // ── extension, risk, obstacles
+    float extE = d * (close - e21) / atrV
+    float extV = d * (close - vLine) / atrV
+    float ext = math.max(extE, extV)
+    bool excessive = ext > extExcess
+    bool bigC = d * (close - open) > 0 and (high - low) > bigCandle * atrV
+    bool lateBlock = excessive or (preferRetest and bigC)
+    float stopRef = bull ? lowestStop : highestStop
+    float stopLvl = bull ? stopRef - stopBuf * atrV : stopRef + stopBuf * atrV
+    float stopDist = d * (close - stopLvl) / atrV
+    float atrStopRef = close - d * atrStopMul * atrV
+    bool stopOk = stopDist > 0 and stopDist <= maxStopAtr
+    float o50 = d * (e50 - close) / atrV
+    float o200 = d * (e200 - close) / atrV
+    float oMin = (o50 > 0 and o200 > 0) ? math.min(o50, o200) : o50 > 0 ? o50 : o200 > 0 ? o200 : na
+    float rr = (na(oMin) or stopDist <= 0) ? na : oMin / stopDist
+    bool rrOk = not useRR or na(rr) or rr >= minRR
+
+    // ── 15M VIDYA gating
+    bool htfBlock = hasHtf and ((htfBlockOpp and rHtf == -1) or (htfReqAll and rHtf != 1))
+    bool htfStrongOk = not hasHtf or not htfNeedStrong or rHtf == 1
+
+    // ── confidence score (0-100). A high score never replaces a missing mandatory condition.
+    bool momAligned = d * cmo > 0
+    bool momStrongD = momAligned and math.abs(cmo) >= cmoStrong
+    bool volAligned = d * volD > 0
+    float pCross = crossValid ? wCross : pairOk ? wCross * 0.4 : 0.0
+    float pBeyond = beyondBoth ? wBeyond : beyondAny ? wBeyond * 0.5 : 0.0
+    float pSlope = slopeOk ? wSlope : d9 == 0 ? wSlope * 0.4 : 0.0
+    float pVState = vStateOk ? wVState : (vPosOk and vSlopeOk) ? wVState * 0.4 : 0.0
+    float pVMom = wVMom * ((vSlopeOk ? 0.5 : 0.0) + ((momStrongD and volAligned) ? 0.5 : (momAligned or volAligned) ? 0.25 : 0.0))
+    float pStruct = wStruct * ((hlConf ? 0.6 : 0.0) + (bos ? 0.4 : 0.0))
+    float pHtf = (hasHtf and not htfOff) ? wHtf * fHtf : 0.0
+    float totalW = wCross + wBeyond + wSlope + wVState + wVMom + wStruct + ((hasHtf and not htfOff) ? wHtf : 0.0)
+    float score = totalW > 0 ? 100.0 * (pCross + pBeyond + pSlope + pVState + pVMom + pStruct + pHtf) / totalW : 0.0
+    bool scoreOkE = score >= minEarly
+
+    // ── lifecycle part 1: invalidation / expiry of a running or armed reversal
+    bool active0 = rev != 0
+    bool brokeLvl = active0 and not na(invLvl) and (bull ? close < invLvl : close > invLvl)
+    bool vRev = active0 and vState == -d and vPos == -d
+    bool xBack = active0 and (bull ? (xdE and close < loMa) : (xuE and close > hiMa))
+    bool invalid = brokeLvl or vRev or xBack
+    bool expired = active0 and bar_index - revBar > revMaxBars
+    bool pInv = invalid
+    if invalid
+        rev := 0
+        lastInvBar := bar_index
+        strongDone := false
+        retestHeld := false
+        lateSent := false
+    else if expired
+        rev := 0
+        strongDone := false
+        retestHeld := false
+        lateSent := false
+
+    // ── lifecycle part 2: new entry (EARLY) or late-armed setup
+    bool cdOk = bar_index - lastSigBar > cooldownBars and bar_index - lastInvBar > cooldownBars
+    bool filtersOk = stopOk and rrOk and not htfBlock and not (fakeBlocks and fakeRaw)
+    bool entryBase = mand and filtersOk and scoreOkE and cdOk and rev != 1
+    bool pEarly = entryBase and not lateBlock
+    bool pLate = entryBase and lateBlock and rev == 0 and not lateSent
+    if pEarly
+        rev := 1
+        revBar := bar_index
+        invLvl := stopLvl
+        lastSigBar := bar_index
+        retests := 0
+        strongDone := false
+        retestHeld := false
+        lateSent := false
+    else if pLate
+        rev := 2
+        revBar := bar_index
+        invLvl := stopLvl
+        lastSigBar := bar_index
+        lateSent := true
+
+    // ── lifecycle part 3: retest entry (also the way an armed late setup finally enters)
+    bool inRev = rev != 0 and bar_index > revBar
+    bool touched = bull ? low <= hiMa + retestTol * atrV : high >= loMa - retestTol * atrV
+    float rngC = high - low
+    float wick = bull ? math.min(open, close) - low : high - math.max(open, close)
+    bool wickOk = rngC > 0 and wick / rngC >= wickPct
+    bool contBreak = bull ? close > high[1] : close < low[1]
+    bool rejected = d * (close - open) > 0 and d * (close - e9) > 0 and (wickOk or contBreak)
+    bool structValid = pairOk and not na(invLvl) and (bull ? low > invLvl : high < invLvl)
+    bool vSupport = vPos == d and vState != -d
+    bool rtCdOk = bar_index - lastRetestBar > retestCool and retests < maxRetests
+    bool pRetest = inRev and touched and rejected and structValid and vSupport and rtCdOk and ext <= extExcess and not pEarly and not pInv
+    if pRetest
+        retests += 1
+        lastRetestBar := bar_index
+        retestHeld := true
+        if rev == 2
+            rev := 1
+            lastSigBar := bar_index
+
+    // ── lifecycle part 4: STRONG upgrade (HL + BOS/HH, strong momentum, held retest, score, 15M support)
+    bool structStrong = hlConf and (bos or (bull ? lastHigh > prevHigh : lastLow < prevLow))
+    bool pStrong = rev == 1 and not strongDone and structStrong and momStrongD and volAligned and retestHeld and score >= strongMin and htfStrongOk and pairOk and vStateOk and vPosOk and not fakeRaw and not pEarly
+    if pStrong
+        strongDone := true
+        lastSigBar := bar_index
+
+    // ── stage 1 REVERSAL WATCH (trend exhaustion) — observation only
+    bool prior = bull ? (close < e21 or e9 < e21) : (close > e21 or e9 > e21)
+    bool w1 = bull ? sl9 >= -slope9Thr : sl9 <= slope9Thr
+    bool w2 = bull ? lbLowOff <= -noNewBars : lbHighOff <= -noNewBars
+    bool w3 = d * (cmo - cmo[3]) > 0
+    bool w4 = d * volD > volPress
+    int wCount = (w1 ? 1 : 0) + (w2 ? 1 : 0) + (w3 ? 1 : 0) + (w4 ? 1 : 0)
+    bool watch = prior and wCount >= watchMin and rev == 0
+
+    // ── stage 2 REVERSAL FORMING / AGGRESSIVE SETUP — never a confirmed entry
+    bool f1 = d * (e9 - e9[1]) > 0 and d * ((e9 - e21) - (e9[2] - e21[2])) > 0
+    bool f2 = d * (close - e9) > 0
+    bool f3 = bull ? aggHL : aggLH
+    bool f4 = vDir != -d or d * (cmo - cmo[2]) > 0
+    bool forming = f1 and f2 and (f3 or f4) and rev == 0
+    bool formingEff = (forming or (mand and score >= devMin)) and rev == 0
+    bool vImproving = d * (cmo - cmo[3]) > 0 and vDir != -d
+    bool aggr = forming and d * (close - e21) > 0 and vImproving and f3
+
+    bool fakeState = fakeRaw and recentX and rev != 1
+    bool watchEdge = watch and not watch[1]
+    bool formEdge = formingEff and not formingEff[1]
+    bool aggrEdge = aggr and not aggr[1]
+    bool fakeEdge = fakeState and not fakeState[1]
+
+    // one pulse code per side per bar, highest priority wins
+    int code = pInv ? 9 : pStrong ? 8 : pEarly ? 7 : pRetest ? 6 : fakeEdge ? 5 : pLate ? 4 : aggrEdge ? 3 : formEdge ? 2 : watchEdge ? 1 : 0
+    int stage = rev == 1 ? (strongDone ? 4 : 3) : rev == 2 ? 3 : formingEff ? 2 : watch ? 1 : 0
+
+    [stage, rev, strongDone, fakeState, aggr, score, code, stopLvl, stopDist, atrStopRef, rr, rHtf]
+
+// ─────────────────────────────────────────── ENGINE (indicators + both sides) ───────────────────────────────────────────
+f_engine(float fHtfB, float fHtfS, int rHtfB, int rHtfS, bool hasHtf) =>
+    float atrRaw = ta.atr(14)
+    float atrV = (na(atrRaw) or atrRaw <= 0) ? close * 0.001 : atrRaw
+
+    // EMAs and their slopes (ATR-normalised so 'flat' means the same on every coin)
+    float e9 = ta.ema(close, len9)
+    float e21 = ta.ema(close, len21)
+    float e50 = ta.ema(close, len50)
+    float e200 = ta.ema(close, len200)
+    float sl9 = (e9 - e9[2]) / 2.0 / atrV
+    float sl21 = (e21 - e21[3]) / 3.0 / atrV
+    float sl50 = (e50 - e50[5]) / 5.0 / atrV
+    float sl200 = (e200 - e200[10]) / 10.0 / atrV
+    int d9 = sl9 > slope9Thr ? 1 : sl9 < -slope9Thr ? -1 : 0
+    int d21 = sl21 > slope21Thr ? 1 : sl21 < -slope21Thr ? -1 : 0
+    int d50 = sl50 > slope50Thr ? 1 : sl50 < -slope50Thr ? -1 : 0
+    int d200 = sl200 > slope200Thr ? 1 : sl200 < -slope200Thr ? -1 : 0
+    int ctx50 = close > e50 ? 1 : -1
+    int ctx200 = close > e200 ? 1 : -1
+    int align = e9 > e21 ? 1 : -1
+    int stack = (e9 > e21 and e21 > e50 and e50 > e200) ? 1 : (e9 < e21 and e21 < e50 and e50 < e200) ? -1 : 0
+
+    // Volumatic VIDYA: CMO-adaptive average → SMA smoothing → ATR bands → trend state → volume accumulation
+    float mom = nz(ta.change(close))
+    float sumPos = math.sum(mom >= 0 ? mom : 0.0, vMom)
+    float sumNeg = math.sum(mom >= 0 ? 0.0 : -mom, vMom)
+    float den = sumPos + sumNeg
+    float cmo = den == 0 ? 0.0 : 100.0 * (sumPos - sumNeg) / den
+    float alpha = 2.0 / (vLen + 1)
+    float kk = alpha * math.abs(cmo) / 100.0
+    var float vRaw = close
+    vRaw := kk * close + (1.0 - kk) * vRaw
+    float vLine = ta.sma(vRaw, vSmooth)
+    float atrB = ta.atr(vAtrLen)
+    float upB = vLine + atrB * vBand
+    float loB = vLine - atrB * vBand
+    bool bandReady = not na(atrB)
+    bool xUpB = ta.crossover(close, upB)
+    bool xDnB = ta.crossunder(close, loB)
+    var int vState = 0
+    int prevVState = vState
+    if bandReady and xUpB
+        vState := 1
+    else if bandReady and xDnB
+        vState := -1
+    else if vSeed and vState == 0 and bandReady
+        vState := close >= vLine ? 1 : -1
+
+    var float upVol = 0.0
+    var float dnVol = 0.0
+    if vState != prevVState
+        upVol := 0.0
+        dnVol := 0.0
+    float vol = nz(volume)
+    upVol += close > open ? vol : 0.0
+    dnVol += close < open ? vol : 0.0
+    float cumD = (upVol + dnVol) > 0 ? 100.0 * (upVol - dnVol) / (upVol + dnVol) : 0.0
+    float rUp = math.sum(close > open ? vol : 0.0, vMom)
+    float rDn = math.sum(close < open ? vol : 0.0, vMom)
+    float volD = (rUp + rDn) > 0 ? 100.0 * (rUp - rDn) / (rUp + rDn) : 0.0
+
+    float vSl = (vLine - vLine[2]) / 2.0 / atrV
+    int vDir = vSl > vSlopeThr ? 1 : vSl < -vSlopeThr ? -1 : 0
+    int vPos = close > vLine ? 1 : close < vLine ? -1 : 0
+    bool vChg = vState != prevVState and prevVState != 0 and vState != 0
+    int vAltCnt = math.round(math.sum(vChg ? 1.0 : 0.0, vAltWin))
+    bool xuE = ta.crossover(e9, e21)
+    bool xdE = ta.crossunder(e9, e21)
+    int crossCnt = math.round(math.sum((xuE or xdE) ? 1.0 : 0.0, chopWin))
+
+    // swing structure — pivots are only used once confirmed (pivR bars after the swing)
+    float pl = ta.pivotlow(low, pivL, pivR)
+    float ph = ta.pivothigh(high, pivL, pivR)
+    var float lastLow = na
+    var float prevLow = na
+    var int lastLowBar = -99999
+    var float lastHigh = na
+    var float prevHigh = na
+    var int lastHighBar = -99999
+    if not na(pl)
+        prevLow := lastLow
+        lastLow := pl
+        lastLowBar := bar_index - pivR
+    if not na(ph)
+        prevHigh := lastHigh
+        lastHigh := ph
+        lastHighBar := bar_index - pivR
+    int structCode = 0
+    if not na(lastLow) and not na(prevLow) and not na(lastHigh) and not na(prevHigh)
+        structCode := lastLowBar > lastHighBar ? (lastLow > prevLow ? 2 : -2) : (lastHigh > prevHigh ? 1 : -1)
+
+    // helpers evaluated every bar (never inside a condition)
+    float low3 = ta.lowest(low, 3)
+    float low8p = ta.lowest(low, 8)[3]
+    float high3 = ta.highest(high, 3)
+    float high8p = ta.highest(high, 8)[3]
+    bool aggHL = low3 > low8p
+    bool aggLH = high3 < high8p
+    int lbLowOff = ta.lowestbars(low, 10)
+    int lbHighOff = ta.highestbars(high, 10)
+    float lowestStop = ta.lowest(low, stopLook)
+    float highestStop = ta.highest(high, stopLook)
+    float rangeAtr = (ta.highest(high, 20) - ta.lowest(low, 20)) / atrV
+    float extUp = math.max((close - e21) / atrV, (close - vLine) / atrV)
+    float extDn = math.max((e21 - close) / atrV, (vLine - close) / atrV)
+    float extA = align == 1 ? extUp : extDn
+
+    [stB, rvB, sdB, fkB, agB, scB, cdB, slB, dsB, asB, rrB, hrB] = f_side(1, e9, e21, e50, e200, d9, sl9, vState, vDir, vPos, vLine, cmo, volD, vAltCnt, crossCnt, xuE, xdE, atrV, lastLow, prevLow, lastLowBar, lastHigh, prevHigh, lastHighBar, lbLowOff, lbHighOff, aggHL, aggLH, lowestStop, highestStop, rangeAtr, fHtfB, rHtfB, hasHtf)
+    [stS, rvS, sdS, fkS, agS, scS, cdS, slS, dsS, asS, rrS, hrS] = f_side(-1, e9, e21, e50, e200, d9, sl9, vState, vDir, vPos, vLine, cmo, volD, vAltCnt, crossCnt, xuE, xdE, atrV, lastLow, prevLow, lastLowBar, lastHigh, prevHigh, lastHighBar, lbLowOff, lbHighOff, aggHL, aggLH, lowestStop, highestStop, rangeAtr, fHtfS, rHtfS, hasHtf)
+
+    float rkB = (rvB == 1 ? 100.0 : rvB == 2 ? 50.0 : 0.0) + stB + (fkB ? 0.5 : 0.0)
+    float rkS = (rvS == 1 ? 100.0 : rvS == 2 ? 50.0 : 0.0) + stS + (fkS ? 0.5 : 0.0)
+    int side = (rkB == 0 and rkS == 0) ? 0 : (rkB >= rkS ? 1 : -1)
+    int stage = side == 1 ? stB : side == -1 ? stS : 0
+    int revSel = side == 1 ? rvB : side == -1 ? rvS : 0
+    bool strongSel = side == 1 ? sdB : side == -1 ? sdS : false
+    bool fakeSel = side == 1 ? fkB : side == -1 ? fkS : false
+    bool lateSel = revSel == 2
+    bool aggrSel = side == 1 ? agB : side == -1 ? agS : false
+    float scoreSel = side == 1 ? scB : side == -1 ? scS : 0.0
+    float stopLvl = side == 1 ? slB : side == -1 ? slS : na
+    float stopDist = side == 1 ? dsB : side == -1 ? dsS : na
+    float atrStopO = side == 1 ? asB : side == -1 ? asS : na
+    float rrO = side == 1 ? rrB : side == -1 ? rrS : na
+    int htfRelO = side == 1 ? hrB : side == -1 ? hrS : 0
+
+    [side * 1.0, stage * 1.0, revSel * 1.0, strongSel ? 1.0 : 0.0, fakeSel ? 1.0 : 0.0, lateSel ? 1.0 : 0.0, aggrSel ? 1.0 : 0.0, scoreSel, d9 * 1.0, d21 * 1.0, ctx50 * 1.0, d50 * 1.0, ctx200 * 1.0, d200 * 1.0, align * 1.0, stack * 1.0, vDir * 1.0, vState * 1.0, vPos * 1.0, cmo, volD, cumD, structCode * 1.0, extA, cdB * 1.0, cdS * 1.0, stopLvl, stopDist, atrStopO, rrO, atrV, htfRelO * 1.0, vLine, upB, loB]
+
+// Same engine, shifted one bar: the value of the last CLOSED bar of whatever timeframe it runs on.
+f_engine_prev() =>
+    [side, stage, rev, strong, fake, late, aggr, score, d9, d21, ctx50, d50, ctx200, d200, align, stack, vDir, vState, vPos, cmo, volD, cumD, structC, extA, codeB, codeS, stopLvl, stopDist, atrStop, rr, atrV, htfRel, vLine, upB, loB] = f_engine(0.0, 0.0, 0, 0, false)
+    [side[1], stage[1], rev[1], strong[1], fake[1], late[1], aggr[1], score[1], d9[1], d21[1], ctx50[1], d50[1], ctx200[1], d200[1], align[1], stack[1], vDir[1], vState[1], vPos[1], cmo[1], volD[1], cumD[1], structC[1], extA[1], codeB[1], codeS[1], stopLvl[1], stopDist[1], atrStop[1], rr[1], atrV[1], htfRel[1], vLine[1], upB[1], loB[1]]
+
+// ─────────────────────────────────────────── 15M SUPPORT MATHS ───────────────────────────────────────────
+// How well does the 15M Volumatic VIDYA back a reversal in direction d? 0..1 (score input) and -1 / 0 / +1 (gating).
+f_htfFrac(int d, float vS, float vD, float vP, float c, float v) =>
+    float f = 0.0
+    f += vS == d ? 0.35 : 0.0
+    f += vD == d ? 0.20 : 0.0
+    f += vP == d ? 0.15 : 0.0
+    f += (d * c > 0 and math.abs(c) >= cmoStrong) ? 0.15 : 0.0
+    f += d * v > 0 ? 0.15 : 0.0
+    f
+
+f_htfRel(int d, float vS, float vD, float vP, float frac) =>
+    (vS == -d and vD == -d and vP == -d) ? -1 : frac >= 0.7 ? 1 : 0
+
+// ─────────────────────────────────────────── OTHER TIMEFRAMES (last closed bar) ───────────────────────────────────────────
+[m1_side, m1_stage, m1_rev, m1_strong, m1_fake, m1_late, m1_aggr, m1_score, m1_d9, m1_d21, m1_ctx50, m1_d50, m1_ctx200, m1_d200, m1_align, m1_stack, m1_vDir, m1_vState, m1_vPos, m1_cmo, m1_volD, m1_cumD, m1_structC, m1_extA, m1_codeB, m1_codeS, m1_stopLvl, m1_stopDist, m1_atrStop, m1_rr, m1_atrV, m1_htfRel, m1_vLine, m1_upB, m1_loB] = request.security(syminfo.tickerid, "1", f_engine_prev(), lookahead=barmerge.lookahead_on)
+[m3_side, m3_stage, m3_rev, m3_strong, m3_fake, m3_late, m3_aggr, m3_score, m3_d9, m3_d21, m3_ctx50, m3_d50, m3_ctx200, m3_d200, m3_align, m3_stack, m3_vDir, m3_vState, m3_vPos, m3_cmo, m3_volD, m3_cumD, m3_structC, m3_extA, m3_codeB, m3_codeS, m3_stopLvl, m3_stopDist, m3_atrStop, m3_rr, m3_atrV, m3_htfRel, m3_vLine, m3_upB, m3_loB] = request.security(syminfo.tickerid, "3", f_engine_prev(), lookahead=barmerge.lookahead_on)
+[m5_side, m5_stage, m5_rev, m5_strong, m5_fake, m5_late, m5_aggr, m5_score, m5_d9, m5_d21, m5_ctx50, m5_d50, m5_ctx200, m5_d200, m5_align, m5_stack, m5_vDir, m5_vState, m5_vPos, m5_cmo, m5_volD, m5_cumD, m5_structC, m5_extA, m5_codeB, m5_codeS, m5_stopLvl, m5_stopDist, m5_atrStop, m5_rr, m5_atrV, m5_htfRel, m5_vLine, m5_upB, m5_loB] = request.security(syminfo.tickerid, "5", f_engine_prev(), lookahead=barmerge.lookahead_on)
+[m15_side, m15_stage, m15_rev, m15_strong, m15_fake, m15_late, m15_aggr, m15_score, m15_d9, m15_d21, m15_ctx50, m15_d50, m15_ctx200, m15_d200, m15_align, m15_stack, m15_vDir, m15_vState, m15_vPos, m15_cmo, m15_volD, m15_cumD, m15_structC, m15_extA, m15_codeB, m15_codeS, m15_stopLvl, m15_stopDist, m15_atrStop, m15_rr, m15_atrV, m15_htfRel, m15_vLine, m15_upB, m15_loB] = request.security(syminfo.tickerid, "15", f_engine_prev(), lookahead=barmerge.lookahead_on)
+
+int chartSec = timeframe.in_seconds(timeframe.period)
+bool hasHtf = chartSec < 900
+float fHtfB = hasHtf ? f_htfFrac(1, m15_vState, m15_vDir, m15_vPos, m15_cmo, m15_volD) : 0.0
+float fHtfS = hasHtf ? f_htfFrac(-1, m15_vState, m15_vDir, m15_vPos, m15_cmo, m15_volD) : 0.0
+int rHtfB = hasHtf ? f_htfRel(1, m15_vState, m15_vDir, m15_vPos, fHtfB) : 0
+int rHtfS = hasHtf ? f_htfRel(-1, m15_vState, m15_vDir, m15_vPos, fHtfS) : 0
+
+// ─────────────────────────────────────────── CHART-TIMEFRAME ENGINE ───────────────────────────────────────────
+[ch_side, ch_stage, ch_rev, ch_strong, ch_fake, ch_late, ch_aggr, ch_score, ch_d9, ch_d21, ch_ctx50, ch_d50, ch_ctx200, ch_d200, ch_align, ch_stack, ch_vDir, ch_vState, ch_vPos, ch_cmo, ch_volD, ch_cumD, ch_structC, ch_extA, ch_codeB, ch_codeS, ch_stopLvl, ch_stopDist, ch_atrStop, ch_rr, ch_atrV, ch_htfRel, ch_vLine, ch_upB, ch_loB] = f_engine(fHtfB, fHtfS, rHtfB, rHtfS, hasHtf)
+
+bool conf = barstate.isconfirmed
+int cB = math.round(ch_codeB)
+int cS = math.round(ch_codeS)
+int code = math.max(cB, cS)
+int lside = cB >= cS ? 1 : -1
+
+// ─────────────────────────────────────────── PLOTS ───────────────────────────────────────────
+float pe9 = ta.ema(close, len9)
+float pe21 = ta.ema(close, len21)
+float pe50 = ta.ema(close, len50)
+float pe200 = ta.ema(close, len200)
+plot(showEMA ? pe9 : na, "EMA 9", color=#ffeb3b, linewidth=1)
+plot(showEMA ? pe21 : na, "EMA 21", color=#ff9800, linewidth=1)
+plot(showEMA ? pe50 : na, "EMA 50", color=#2196f3, linewidth=2)
+plot(showEMA ? pe200 : na, "EMA 200", color=#ab47bc, linewidth=2)
+color vCol = ch_vState > 0 ? cBull : ch_vState < 0 ? cBear : color.gray
+plot(showVidya ? ch_vLine : na, "Volumatic VIDYA", color=vCol, linewidth=2)
+plot(showBands ? ch_upB : na, "VIDYA upper band", color=color.new(cBull, 65))
+plot(showBands ? ch_loB : na, "VIDYA lower band", color=color.new(cBear, 65))
+
+// ─────────────────────────────────────────── LABELS (one per bar, highest priority) ───────────────────────────────────────────
+f_relTxt15(int r) =>
+    r == 1 ? "15M VIDYA SUPPORTS" : r == -1 ? "COUNTER-TREND (15M VIDYA OPPOSES)" : "15M VIDYA DEVELOPING"
+
+string sideTxt = lside == 1 ? "BUY" : "SELL"
+int relSel = lside == 1 ? rHtfB : rHtfS
+string relTxt = hasHtf ? f_relTxt15(relSel) : "15M check n/a on this chart TF"
+string lblText = switch code
+    9 => "❌ REVERSAL INVALIDATED"
+    8 => "🔥 STRONG EARLY " + sideTxt
+    7 => "⚡ EARLY " + sideTxt + (hasHtf ? " — " + relTxt : "")
+    6 => (lside == 1 ? "🟢 BUY RETEST" : "🔴 SELL RETEST")
+    5 => "⚠️ POSSIBLE FAKE REVERSAL"
+    4 => "⏳ WAIT FOR PULLBACK — LATE ENTRY"
+    3 => "🟡 REVERSAL FORMING\nAGGRESSIVE SETUP — WAIT FOR CONFIRMATION"
+    2 => "🟡 REVERSAL FORMING"
+    1 => "🔍 REVERSAL WATCH"
+    => ""
+color lblColor = switch code
+    9 => color.new(color.gray, 0)
+    8 => lside == 1 ? cBull : cBear
+    7 => lside == 1 ? cBull : cBear
+    6 => lside == 1 ? cBull : cBear
+    5 => color.orange
+    4 => color.purple
+    3 => color.new(color.yellow, 10)
+    2 => color.new(color.yellow, 25)
+    => color.new(color.gray, 20)
+color lblTxtColor = (code == 3 or code == 2) ? color.black : color.white
+bool codeOk = code >= 6 or (not actionOnly and ((code == 5 and showFake) or code == 4 or (code >= 1 and code <= 3 and showWF)))
+bool above = code == 9 ? lside == 1 : lside == -1
+string tip = "Score " + str.tostring(ch_score, "#") + "/100 · 15M: " + (hasHtf ? f_relTxt15(relSel) : "n/a") + "\nStructure stop: " + (ch_side == lside ? str.tostring(ch_stopLvl, format.mintick) + " (" + str.tostring(ch_stopDist, "#.##") + " ATR)" : "—") + "\nATR stop ref: " + (ch_side == lside ? str.tostring(ch_atrStop, format.mintick) : "—") + "\nR:R to nearest EMA50/200: " + (ch_side == lside and not na(ch_rr) ? str.tostring(ch_rr, "#.##") : "—") + "\nExtension vs EMA21/VIDYA: " + str.tostring(ch_extA, "#.##") + " ATR"
+if conf and code > 0 and codeOk
+    label.new(bar_index, above ? high : low, text=lblText, style=above ? label.style_label_down : label.style_label_up, color=lblColor, textcolor=lblTxtColor, size=size.small, tooltip=tip)
+
+// ─────────────────────────────────────────── ALERTS (confirmed bar, one per event) ───────────────────────────────────────────
+alertcondition(conf and cB == 7, "EARLY BUY", "⚡ EARLY BUY {{ticker}} {{interval}} @ {{close}}")
+alertcondition(conf and cS == 7, "EARLY SELL", "⚡ EARLY SELL {{ticker}} {{interval}} @ {{close}}")
+alertcondition(conf and (cB == 8 or cS == 8), "STRONG EARLY REVERSAL (buy or sell)", "🔥 STRONG EARLY REVERSAL {{ticker}} {{interval}} @ {{close}}")
+alertcondition(conf and cB == 8, "STRONG EARLY BUY", "🔥 STRONG EARLY BUY {{ticker}} {{interval}} @ {{close}}")
+alertcondition(conf and cS == 8, "STRONG EARLY SELL", "🔥 STRONG EARLY SELL {{ticker}} {{interval}} @ {{close}}")
+alertcondition(conf and cB == 6, "BUY RETEST", "🟢 BUY RETEST {{ticker}} {{interval}} @ {{close}}")
+alertcondition(conf and cS == 6, "SELL RETEST", "🔴 SELL RETEST {{ticker}} {{interval}} @ {{close}}")
+alertcondition(conf and (cB == 9 or cS == 9), "REVERSAL INVALIDATED", "❌ REVERSAL INVALIDATED {{ticker}} {{interval}} @ {{close}}")
+alertcondition(conf and (cB == 5 or cS == 5), "POSSIBLE FAKE REVERSAL", "⚠️ POSSIBLE FAKE REVERSAL {{ticker}} {{interval}} @ {{close}}")
+alertcondition(conf and (cB == 4 or cS == 4), "WAIT FOR PULLBACK", "⏳ WAIT FOR PULLBACK {{ticker}} {{interval}} @ {{close}}")
+
+// ─────────────────────────────────────────── DASHBOARD ───────────────────────────────────────────
+I_SIDE = 0
+I_STAGE = 1
+I_REV = 2
+I_STRONG = 3
+I_FAKE = 4
+I_LATE = 5
+I_AGGR = 6
+I_SCORE = 7
+I_D9 = 8
+I_D21 = 9
+I_CTX50 = 10
+I_D50 = 11
+I_CTX200 = 12
+I_D200 = 13
+I_ALIGN = 14
+I_STACK = 15
+I_VDIR = 16
+I_VSTATE = 17
+I_VPOS = 18
+I_CMO = 19
+I_VOLD = 20
+I_CUMD = 21
+I_STRUCTC = 22
+I_EXTA = 23
+I_CODEB = 24
+I_CODES = 25
+I_STOPLVL = 26
+I_STOPDIST = 27
+I_ATRSTOP = 28
+I_RR = 29
+I_ATRV = 30
+I_HTFREL = 31
+I_VLINE = 32
+I_UPB = 33
+I_LOB = 34
+
+f_g(array<float> c, int i) =>
+    array.get(c, i)
+
+f_gi(array<float> c, int i) =>
+    math.round(array.get(c, i))
+
+f_arrow(int x) =>
+    x > 0 ? "↑" : x < 0 ? "↓" : "→"
+
+f_dirCol(int x) =>
+    x > 0 ? color.new(cBull, 70) : x < 0 ? color.new(cBear, 70) : color.new(color.gray, 75)
+
+// How a cell relates to a reversal in direction s: 2 same-direction reversal running · 1 developing · -1 opposing · 0 neutral
+f_tfRel(array<float> c, int s) =>
+    int r = 0
+    if f_gi(c, I_REV) == 1 and f_gi(c, I_SIDE) == s
+        r := 2
+    else if f_gi(c, I_STAGE) >= 2 and f_gi(c, I_SIDE) == s
+        r := 1
+    else if f_gi(c, I_ALIGN) == -s and f_gi(c, I_VSTATE) == -s
+        r := -1
+    r
+
+f_relTxt(string nm, int r) =>
+    r == 2 ? nm + " CONFIRMING" : r == 1 ? nm + " SUPPORT DEVELOPING" : r == -1 ? nm + " COUNTER-TREND" : nm + " NEUTRAL"
+
+f_rel15(array<float> c, int s) =>
+    float fr = f_htfFrac(s, f_g(c, I_VSTATE), f_g(c, I_VDIR), f_g(c, I_VPOS), f_g(c, I_CMO), f_g(c, I_VOLD))
+    f_htfRel(s, f_g(c, I_VSTATE), f_g(c, I_VDIR), f_g(c, I_VPOS), fr)
+
+f_rel15Txt(int r) =>
+    r == 1 ? "15M VIDYA SUPPORTS (real strength)" : r == -1 ? "15M VIDYA OPPOSES (counter-trend)" : "15M VIDYA DEVELOPING"
+
+f_aligned(array<float> c, int s) =>
+    f_gi(c, I_ALIGN) == s and f_gi(c, I_VSTATE) == s
+
+// Headline for the whole table (scenarios A-D of the spec, with the 15M VIDYA as the strength check).
+f_overall(array<float> c1, array<float> c3, array<float> c5, array<float> c15) =>
+    string t = "NO ACTIVE REVERSAL"
+    color col = color.new(color.gray, 40)
+    int p = f_gi(c1, I_REV) == 1 ? 1 : f_gi(c3, I_REV) == 1 ? 3 : f_gi(c5, I_REV) == 1 ? 5 : 0
+    if p != 0
+        array<float> pc = p == 1 ? c1 : p == 3 ? c3 : c5
+        int s = f_gi(pc, I_SIDE)
+        bool strong = f_gi(pc, I_STRONG) == 1
+        string nm = p == 1 ? "1M" : p == 3 ? "3M" : "5M"
+        string act = (strong ? "🔥 " : "⚡ ") + nm + (strong ? " STRONG EARLY " : " EARLY ") + (s > 0 ? "BUY" : "SELL")
+        int r15 = f_rel15(c15, s)
+        int r3 = p == 1 ? f_tfRel(c3, s) : 0
+        int r5 = p <= 3 ? f_tfRel(c5, s) : 0
+        bool allOpp = r15 == -1 and (p != 1 or r3 == -1) and (p == 5 or r5 == -1)
+        if allOpp
+            t := "⚠️ " + nm + " COUNTER-TREND REVERSAL — HIGHER TIMEFRAMES OPPOSE (confidence reduced)"
+            col := color.new(color.orange, 30)
+        else
+            t := act + " — " + f_rel15Txt(r15) + (p == 1 ? " — " + f_relTxt("3M", r3) : "") + (p <= 3 ? " — " + f_relTxt("5M", r5) : "")
+            col := s > 0 ? color.new(cBull, 30) : color.new(cBear, 30)
+    else if f_gi(c1, I_REV) == 2
+        t := "⏳ 1M SETUP VALID BUT EXTENDED — WAIT FOR A PULLBACK (RETEST), NOT A CHASE"
+        col := color.new(color.purple, 30)
+    else if f_gi(c1, I_FAKE) == 1
+        t := "⚠️ 1M POSSIBLE FAKE REVERSAL — NO ENTRY"
+        col := color.new(color.orange, 30)
+    else
+        int a = f_gi(c1, I_ALIGN)
+        bool full = f_aligned(c1, a) and f_aligned(c3, a) and f_aligned(c5, a) and f_aligned(c15, a)
+        if full
+            string dn = a > 0 ? "BULLISH" : "BEARISH"
+            if f_g(c1, I_EXTA) > extExcess
+                t := "⏳ " + dn + " ALIGNMENT — WAIT FOR PULLBACK"
+                col := color.new(color.purple, 30)
+            else
+                t := dn + " ALIGNMENT — TREND ALREADY RUNNING, NOT A FRESH REVERSAL ENTRY"
+                col := color.new(color.gray, 30)
+        else
+            int q = f_gi(c1, I_STAGE) >= 1 ? 1 : f_gi(c3, I_STAGE) >= 1 ? 3 : f_gi(c5, I_STAGE) >= 1 ? 5 : 0
+            if q != 0
+                array<float> qc = q == 1 ? c1 : q == 3 ? c3 : c5
+                string qn = q == 1 ? "1M" : q == 3 ? "3M" : "5M"
+                t := "🟡 " + qn + (f_gi(qc, I_STAGE) == 1 ? " REVERSAL WATCH" : " REVERSAL FORMING") + " — NOT A SIGNAL YET"
+                col := color.new(color.yellow, 50)
+    [t, col]
+
+f_col(table tb, int col, array<float> c, string title) =>
+    int side = f_gi(c, I_SIDE)
+    int stage = f_gi(c, I_STAGE)
+    int rev = f_gi(c, I_REV)
+    bool strong = f_gi(c, I_STRONG) == 1
+    bool fake = f_gi(c, I_FAKE) == 1
+    bool late = f_gi(c, I_LATE) == 1
+    bool aggr = f_gi(c, I_AGGR) == 1
+    int d9 = f_gi(c, I_D9)
+    int d21 = f_gi(c, I_D21)
+    int c50 = f_gi(c, I_CTX50)
+    int d50 = f_gi(c, I_D50)
+    int c200 = f_gi(c, I_CTX200)
+    int d200 = f_gi(c, I_D200)
+    int al = f_gi(c, I_ALIGN)
+    int stk = f_gi(c, I_STACK)
+    int vDir = f_gi(c, I_VDIR)
+    int vSt = f_gi(c, I_VSTATE)
+    int vPs = f_gi(c, I_VPOS)
+    float cmo = f_g(c, I_CMO)
+    float volD = f_g(c, I_VOLD)
+    float cumD = f_g(c, I_CUMD)
+    int stc = f_gi(c, I_STRUCTC)
+    float score = f_g(c, I_SCORE)
+
+    table.cell(tb, col, 0, title, text_color=color.white, bgcolor=color.new(color.gray, 55), text_size=dashSize)
+    table.cell(tb, col, 1, f_arrow(d9), text_color=color.white, bgcolor=f_dirCol(d9), text_size=dashSize)
+    table.cell(tb, col, 2, f_arrow(d21), text_color=color.white, bgcolor=f_dirCol(d21), text_size=dashSize)
+    table.cell(tb, col, 3, (c50 > 0 ? "Bull " : "Bear ") + f_arrow(d50), text_color=color.white, bgcolor=f_dirCol(c50), text_size=dashSize)
+    table.cell(tb, col, 4, (c200 > 0 ? "Bull " : "Bear ") + f_arrow(d200), text_color=color.white, bgcolor=f_dirCol(c200), text_size=dashSize)
+    table.cell(tb, col, 5, (al > 0 ? "Bull" : "Bear") + (stk != 0 ? " (full)" : ""), text_color=color.white, bgcolor=f_dirCol(al), text_size=dashSize)
+    table.cell(tb, col, 6, (vSt > 0 ? "↑ Bull" : vSt < 0 ? "↓ Bear" : "—") + " · line " + (vDir > 0 ? "↗" : vDir < 0 ? "↘" : "→") + " · " + (vPs > 0 ? "P>V" : vPs < 0 ? "P<V" : "P=V"), text_color=color.white, bgcolor=f_dirCol(vSt), text_size=dashSize)
+    table.cell(tb, col, 7, (math.abs(cmo) >= cmoStrong ? "Strong" : "Weak") + (cmo > 0 ? " ▲ " : " ▼ ") + "Δ" + str.tostring(volD, "#") + "% / " + str.tostring(cumD, "#") + "%", text_color=color.white, bgcolor=f_dirCol(cmo > 0 ? 1 : -1), text_size=dashSize)
+    string stTxt = stc == 1 ? "HH" : stc == 2 ? "HL" : stc == -1 ? "LH" : stc == -2 ? "LL" : "—"
+    table.cell(tb, col, 8, stTxt, text_color=color.white, bgcolor=f_dirCol(stc > 0 ? 1 : stc < 0 ? -1 : 0), text_size=dashSize)
+    string stgTxt = stage == 4 ? "S4 STRONG" : stage == 3 ? "S3 EARLY" : stage == 2 ? (aggr ? "S2 AGGRESSIVE" : "S2 FORMING") : stage == 1 ? "S1 WATCH" : "S0 —"
+    table.cell(tb, col, 9, stgTxt, text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=dashSize)
+    string sig = "WAIT"
+    color sigCol = color.new(color.gray, 70)
+    if rev == 1
+        sig := (strong ? "🔥 " : "⚡ ") + (side > 0 ? "BUY" : "SELL")
+        sigCol := side > 0 ? color.new(cBull, 25) : color.new(cBear, 25)
+    else if late
+        sig := "⏳ WAIT PULLBACK"
+        sigCol := color.new(color.purple, 35)
+    else if fake
+        sig := "⚠️ FAKE?"
+        sigCol := color.new(color.orange, 35)
+    else if stage == 2 and aggr
+        sig := "WAIT · AGGR " + (side > 0 ? "BUY" : "SELL")
+    else if stage >= 1
+        sig := "WAIT · " + (stage == 1 ? "WATCH" : "FORMING")
+    table.cell(tb, col, 10, sig, text_color=color.white, bgcolor=sigCol, text_size=dashSize)
+    table.cell(tb, col, 11, side != 0 ? str.tostring(score, "#") + "/100" : "—", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=dashSize)
+
+var table dash = table.new(dashPosSel == "top_left" ? position.top_left : dashPosSel == "bottom_right" ? position.bottom_right : dashPosSel == "bottom_left" ? position.bottom_left : dashPosSel == "middle_right" ? position.middle_right : dashPosSel == "middle_left" ? position.middle_left : position.top_right, 5, 14, bgcolor=color.new(color.black, 25), border_width=1, border_color=color.new(color.gray, 60), frame_width=1, frame_color=color.new(color.gray, 40))
+if showDash and barstate.islast
+    array<float> aCh = array.from((conf ? ch_side : ch_side[1]), (conf ? ch_stage : ch_stage[1]), (conf ? ch_rev : ch_rev[1]), (conf ? ch_strong : ch_strong[1]), (conf ? ch_fake : ch_fake[1]), (conf ? ch_late : ch_late[1]), (conf ? ch_aggr : ch_aggr[1]), (conf ? ch_score : ch_score[1]), (conf ? ch_d9 : ch_d9[1]), (conf ? ch_d21 : ch_d21[1]), (conf ? ch_ctx50 : ch_ctx50[1]), (conf ? ch_d50 : ch_d50[1]), (conf ? ch_ctx200 : ch_ctx200[1]), (conf ? ch_d200 : ch_d200[1]), (conf ? ch_align : ch_align[1]), (conf ? ch_stack : ch_stack[1]), (conf ? ch_vDir : ch_vDir[1]), (conf ? ch_vState : ch_vState[1]), (conf ? ch_vPos : ch_vPos[1]), (conf ? ch_cmo : ch_cmo[1]), (conf ? ch_volD : ch_volD[1]), (conf ? ch_cumD : ch_cumD[1]), (conf ? ch_structC : ch_structC[1]), (conf ? ch_extA : ch_extA[1]), (conf ? ch_codeB : ch_codeB[1]), (conf ? ch_codeS : ch_codeS[1]), (conf ? ch_stopLvl : ch_stopLvl[1]), (conf ? ch_stopDist : ch_stopDist[1]), (conf ? ch_atrStop : ch_atrStop[1]), (conf ? ch_rr : ch_rr[1]), (conf ? ch_atrV : ch_atrV[1]), (conf ? ch_htfRel : ch_htfRel[1]), (conf ? ch_vLine : ch_vLine[1]), (conf ? ch_upB : ch_upB[1]), (conf ? ch_loB : ch_loB[1]))
+    array<float> a1 = array.from(m1_side, m1_stage, m1_rev, m1_strong, m1_fake, m1_late, m1_aggr, m1_score, m1_d9, m1_d21, m1_ctx50, m1_d50, m1_ctx200, m1_d200, m1_align, m1_stack, m1_vDir, m1_vState, m1_vPos, m1_cmo, m1_volD, m1_cumD, m1_structC, m1_extA, m1_codeB, m1_codeS, m1_stopLvl, m1_stopDist, m1_atrStop, m1_rr, m1_atrV, m1_htfRel, m1_vLine, m1_upB, m1_loB)
+    array<float> a3 = array.from(m3_side, m3_stage, m3_rev, m3_strong, m3_fake, m3_late, m3_aggr, m3_score, m3_d9, m3_d21, m3_ctx50, m3_d50, m3_ctx200, m3_d200, m3_align, m3_stack, m3_vDir, m3_vState, m3_vPos, m3_cmo, m3_volD, m3_cumD, m3_structC, m3_extA, m3_codeB, m3_codeS, m3_stopLvl, m3_stopDist, m3_atrStop, m3_rr, m3_atrV, m3_htfRel, m3_vLine, m3_upB, m3_loB)
+    array<float> a5 = array.from(m5_side, m5_stage, m5_rev, m5_strong, m5_fake, m5_late, m5_aggr, m5_score, m5_d9, m5_d21, m5_ctx50, m5_d50, m5_ctx200, m5_d200, m5_align, m5_stack, m5_vDir, m5_vState, m5_vPos, m5_cmo, m5_volD, m5_cumD, m5_structC, m5_extA, m5_codeB, m5_codeS, m5_stopLvl, m5_stopDist, m5_atrStop, m5_rr, m5_atrV, m5_htfRel, m5_vLine, m5_upB, m5_loB)
+    array<float> a15 = array.from(m15_side, m15_stage, m15_rev, m15_strong, m15_fake, m15_late, m15_aggr, m15_score, m15_d9, m15_d21, m15_ctx50, m15_d50, m15_ctx200, m15_d200, m15_align, m15_stack, m15_vDir, m15_vState, m15_vPos, m15_cmo, m15_volD, m15_cumD, m15_structC, m15_extA, m15_codeB, m15_codeS, m15_stopLvl, m15_stopDist, m15_atrStop, m15_rr, m15_atrV, m15_htfRel, m15_vLine, m15_upB, m15_loB)
+    array<float> c1 = chartSec == 60 ? aCh : a1
+    array<float> c3 = chartSec == 180 ? aCh : a3
+    array<float> c5 = chartSec == 300 ? aCh : a5
+    array<float> c15 = chartSec == 900 ? aCh : a15
+
+    array<string> labels = array.from("", "EMA 9 dir", "EMA 21 dir", "EMA 50 ctx", "EMA 200 ctx", "9/21 align", "VIDYA dir", "VIDYA momentum", "Structure", "Stage", "Signal", "Score")
+    for i = 0 to 11
+        table.cell(dash, 0, i, array.get(labels, i), text_color=color.new(color.white, 10), bgcolor=color.new(color.gray, 55), text_halign=text.align_left, text_size=dashSize)
+    f_col(dash, 1, c1, chartSec == 60 ? "1M ●" : "1M")
+    f_col(dash, 2, c3, chartSec == 180 ? "3M ●" : "3M")
+    f_col(dash, 3, c5, chartSec == 300 ? "5M ●" : "5M")
+    f_col(dash, 4, c15, chartSec == 900 ? "15M ●" : "15M ★")
+
+    [ovTxt, ovCol] = f_overall(c1, c3, c5, c15)
+    table.cell(dash, 0, 12, ovTxt, text_color=color.white, bgcolor=ovCol, text_halign=text.align_left, text_size=dashSize)
+    table.merge_cells(dash, 0, 12, 4, 12)
+    string note = chartSec < 60 ? "⚠ Use a chart of 1M or higher." : chartSec > 60 ? "● chart TF. Cells below the chart TF show their last CLOSED bar (the engine still runs on every bar of that TF)." : "● chart TF · other TFs: last CLOSED bar · ★ = strength check."
+    table.cell(dash, 0, 13, note + " Closed-candle values. Not financial advice — signals can fail.", text_color=color.new(color.white, 25), bgcolor=color.new(color.black, 40), text_halign=text.align_left, text_size="tiny")
+    table.merge_cells(dash, 0, 13, 4, 13)
